@@ -1,0 +1,1159 @@
+---
+title: "USDA Census of Agriculture — AFPC Partner CSV Exports (Alaska)"
+subtitle: "Table 1 Summary (State + Ag Census Areas) and Trimmed Ch 2 Compact Files"
+author: |
+  | Michael S. Jones
+  | Research Assistant Professor of Economics
+  | Institute of Social and Economic Research (ISER)
+  | University of Alaska Anchorage
+  | msjones6@alaska.edu
+  | Detailed prompts with Claude Opus models to generate the following extract code
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+
+# ==========================================================================================================================
+#SET THE FOLLOWING FOR YOUR MACHINE
+# NASS API key — uses NASS_API_KEY from .Renviron when set, otherwise this value
+NASS_API_KEY <- Sys.getenv("NASS_API_KEY", unset = "[YOUR NASS API KEY]")
+
+# Output directory — adjust to your local path (Google Drive mapped path for Windows)
+folder_prefix <- "[YOUR TARGET FOLDER LOCATION]"
+# ==========================================================================================================================
+
+
+
+
+# ============================================================================
+# PARTNER EXPORT PIPELINE — USDA Census of Agriculture, Alaska
+# ----------------------------------------------------------------------------
+# One knit  →  four CSVs in OUT_DIR/partner_exports/
+#   (1) Table 1 (State Summary Highlights) — state level, all Census years
+#   (2) Table 1 (State Summary Highlights) — Ag Census Area level, all Census years
+#   (3) Ch 2 compact file — state (+ US) level, same trim as the original pull
+#   (4) Ch 2 compact file — county / Ag Census Area level, same trim as before
+#
+# Every API call is cached as its own .rds, so re-knitting only re-pulls calls
+# that are missing or previously failed. Set REFRESH_CACHE <- TRUE to force a
+# full re-pull (NASS revisions, 2027 Census release).
+#
+# Inputs (same folder as this Rmd):
+#   ch2_metadata_lookup.csv                               (required)
+#   User-Guide-2022-Census-of-Ag-Data-on-Quick-Stats 1.xlsx (optional; gives
+#     Table 1 its published row order — falls back to lookup order if absent)
+# ============================================================================
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# ============================================================================
+# PACKAGES
+# ============================================================================
+required_packages <- c("dplyr", "tidyr", "readr", "stringr", "tibble",
+                       "glue", "janitor", "rnassqs", "readxl", "knitr")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, quiet = TRUE, repos = "https://cran.rstudio.com/")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# ============================================================================
+# CONFIGURATION — EDIT THESE
+# ============================================================================
+
+
+# State
+STATE_ALPHA <- "AK"
+
+# # Keep US (NATIONAL) rows in export (3), as the original state compact file did
+# PULL_NATIONAL <- TRUE
+# Keep US (NATIONAL) rows in export (3), as the original state compact file did
+PULL_NATIONAL <- TRUE
+
+# Data source for the four exports
+#   "saved" = rebuild from the unfiltered master CSVs the original pulls already
+#             wrote to OUT_DIR — no API calls
+#   "api"   = pull fresh from Quick Stats (cached per call; use after a new Census release)
+#DATA_SOURCE        <- "saved"
+DATA_SOURCE        <- "api"
+
+MASTER_STATE_FILE  <- glue("afpc_census_of_ag_{STATE_ALPHA}_all_years.csv")         # state (+ US) master
+MASTER_COUNTY_FILE <- glue("afpc_census_of_ag_{STATE_ALPHA}_county_all_years.csv")  # county master
+STATE_FIPS         <- "02"   # fills geo_code in export (1); the saved masters don't carry it
+
+OUT_DIR       <- paste0(folder_prefix, "afpc_pull")
+EXPORT_SUBDIR <- "partner_exports"      # the four CSVs land in OUT_DIR/partner_exports
+
+# API response cache (lives in OUT_DIR/_nass_api_cache, outside the export folder)
+USE_CACHE     <- TRUE
+
+REFRESH_CACHE <- FALSE    # TRUE = wipe this lookup's cache and re-pull everything
+#REFRESH_CACHE <- TRUE    # TRUE = wipe this lookup's cache and re-pull everything
+
+# Census years kept in all four exports
+CENSUS_YEARS      <- c(1997, 2002, 2007, 2012, 2017, 2022, 2027, 2032, 2037)
+CENSUS_YEARS_ONLY <- TRUE
+
+# Table 1 = Ch 2 Table 1, "State Summary Highlights" in the 2022 User Guide
+TABLE1_NUM <- 1
+
+# Added rows at the end of exports (1) and (2): food fish (hatchery) context from
+# Ch 2 Table 22, and Table 1 sales with food fish netted out
+ADD_CONTEXT_ROWS          <- TRUE
+FOOD_FISH_MISSING_AS_ZERO <- TRUE   # no food fish row for a geography-year = $0 (none reported)
+
+API_TIMEOUT       <- 120   # seconds before one call is abandoned and split into smaller calls
+MAX_CONSEC_FAILS  <- 3     # stop the pull after this many failed calls in a row (re-knit resumes)
+
+# Files (1) and (2) share one schema, so partners can stack them:
+# `geo_level, state_alpha, geo_code, geo_name, year, table_row, data_item, short_desc,
+# domain_desc, domaincat_desc, unit_desc, value, value_num, censored, row_type, var_name, note`.
+# `table_row` is the line number in the published Table 1; `data_item` is `short_desc`
+# plus the size or sales class where the cell has one; `var_name` is a short
+# snake_case name for each row.
+
+# **Added rows (end of files 1 and 2).** NASS's market value of agricultural products
+# sold includes food fish (excluding catfish and trout). In Alaska that is almost entirely
+# salmon hatchery production, which is roughly as large as all crop sales and hides
+# the conventional-agriculture picture. Six rows follow the published cells, marked
+# by `row_type`:
+
+# | var_name | row_type | What it is |
+# |---|---|---|
+# | `food_fish_sales_usd` | Added context | Food fish sales and distribution ($), from Ch 2 Table 22 |
+# | `food_fish_operations` | Added context | Operations reporting food fish, from Ch 2 Table 22 |
+# | `ag_sales_excl_food_fish_usd` | Derived | Total ag sales minus food fish |
+# | `animal_sales_excl_food_fish_usd` | Derived | Livestock, poultry and products (incl. other aquaculture) minus food fish |
+# | `food_fish_pct_of_ag_sales` | Derived | Food fish as a percent of total ag sales |
+# | `ag_sales_excl_food_fish_per_farm_usd` | Derived | Ag sales excl. food fish per farm, food fish operations excluded from the farm count |
+
+# A derived value shows `(D)` when any of its inputs is withheld. The `note` column
+# gives each row's formula. Expenses and net cash income can't be separated from
+# hatchery operations with published data, so those Table 1 rows are left as NASS
+# reports them.
+
+# Compact-file trim for exports (3) and (4) — identical to the original pulls
+COMPACT_DOMAINS_KEEP <- c("TOTAL", "NAICS CLASSIFICATION")
+DROP_OTHER_COUNTIES  <- TRUE     # drop "OTHER (COMBINED) COUNTIES" rollups in (2) and (4)
+
+# API pacing
+API_DELAY         <- 1.5   # seconds between calls
+CHUNK_SIZE_STATE  <- 40    # short_desc values per call, STATE / NATIONAL (avoids 414 URI Too Long)
+CHUNK_SIZE_COUNTY <- 30    # short_desc values per call, COUNTY
+
+# Output file names — (3) and (4) keep the names partners already have
+FILE_T1_STATE       <- glue("afpc_coa_{STATE_ALPHA}_table1_state_all_years.csv")
+FILE_T1_AREA        <- glue("afpc_coa_{STATE_ALPHA}_table1_ag_census_area_all_years.csv")
+FILE_COMPACT_STATE  <- glue("afpc_census_of_ag_{STATE_ALPHA}_compact.csv")
+FILE_COMPACT_COUNTY <- glue("afpc_census_of_ag_{STATE_ALPHA}_county_compact.csv")
+
+# Contact
+CONTACT_NOTE <- "Contact: M. Jones (UAA-ISER) • msjones6@alaska.edu"
+
+# ============================================================================
+# PATHS — resolved relative to this Rmd (works for Knit, chunk-by-chunk, or render())
+# ============================================================================
+rmd_dir <- function() {
+  p <- tryCatch(knitr::current_input(dir = TRUE), error = function(e) NULL)
+  if (!is.null(p)) return(dirname(p))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(dirname(p))
+  }
+  getwd()
+}
+RMD_DIR <- rmd_dir()
+
+find_input <- function(fname, pattern = NULL) {
+  dirs <- unique(c(RMD_DIR, getwd()))
+  hits <- file.path(dirs, fname)
+  hits <- hits[file.exists(hits)]
+  if (!length(hits) && !is.null(pattern)) {
+    hits <- unlist(lapply(dirs, list.files, pattern = pattern, full.names = TRUE))
+  }
+  if (length(hits)) hits[1] else NA_character_
+}
+
+LOOKUP_PATH <- find_input("ch2_metadata_lookup.csv")
+GUIDE_PATH  <- find_input("User-Guide-2022-Census-of-Ag-Data-on-Quick-Stats 1.xlsx",
+                          pattern = "^User-Guide-2022-Census-of-Ag.*\\.xlsx$")
+
+# Fallback for non-Windows / testing (same rule as the original pulls)
+if (!dir.exists(dirname(OUT_DIR))) OUT_DIR <- file.path(RMD_DIR, "afpc_pull")
+EXPORT_DIR <- file.path(OUT_DIR, EXPORT_SUBDIR)
+dir.create(EXPORT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+cat("========================================\n")
+cat("AFPC Census of Ag — Partner Exports —", STATE_ALPHA, "\n")
+cat("Started:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("Exports:", EXPORT_DIR, "\n")
+cat("========================================\n\n")
+
+```
+
+# Overview
+
+This workbook produces the four partner CSVs from a single, cached pull of the
+NASS Quick Stats API (`rnassqs`), driven by the same Ch 2 metadata crosswalk
+(`ch2_metadata_lookup.csv`) used for the original AFPC state and county pulls.
+
+| # | File | Geography | Contents |
+|---|------|-----------|----------|
+| 1 | `r FILE_T1_STATE` | State (`r STATE_ALPHA`) | Table 1 *State Summary Highlights* — every Table 1 cell NASS publishes for the state, all Census years, tidy long format in published row order |
+| 2 | `r FILE_T1_AREA` | Ag Census Areas | Same Table 1 cells and layout, one block per Ag Census Area |
+| 3 | `r FILE_COMPACT_STATE` | State (+ US) | Ch 2 Tables 1–57, same trim as before (Census years; `TOTAL` + `NAICS CLASSIFICATION` domains) |
+| 4 | `r FILE_COMPACT_COUNTY` | Ag Census Areas | Ch 2 Tables 1–57 at county level, same trim as before (`OTHER (COMBINED)` rollups dropped) |
+
+Files (1) and (2) share one schema, so partners can stack them:
+`geo_level, state_alpha, geo_code, geo_name, year, table_row, data_item, short_desc,
+domain_desc, domaincat_desc, unit_desc, value, value_num, censored`.
+`table_row` is the line number in the published Table 1; `data_item` is `short_desc`
+plus the size or sales class where the cell has one.
+
+**Why Table 1 is built from the full pull, not the compact files.** Table 1 includes
+farms by size class (`AREA OPERATED` domain) and farms by value of sales
+(`FARM SALES` domain). The compact files' domain whitelist drops those rows, so
+files (1) and (2) are matched cell-by-cell on `short_desc` × `domain_desc` ×
+`domaincat_desc` against the raw pull instead.
+
+**Ag Census Areas.** For Alaska, Quick Stats' `COUNTY` level is NASS's five
+Agriculture Census Areas — Aleutian Islands, Anchorage, Fairbanks, Juneau and
+Kenai Peninsula — each grouping several boroughs/census areas for data collection.
+
+# Load Metadata Lookup
+
+```{r load_lookup}
+stopifnot("ch2_metadata_lookup.csv not found — place it next to this Rmd" = !is.na(LOOKUP_PATH))
+
+lookup_raw <- read_csv(LOOKUP_PATH, show_col_types = FALSE) %>%
+  clean_names()
+
+target_short_descs <- unique(lookup_raw$short_desc)
+
+cat("Lookup:", LOOKUP_PATH, "\n")
+cat("  Rows:", nrow(lookup_raw), "| Tables:", n_distinct(lookup_raw$table),
+    "| Unique short_desc:", length(target_short_descs), "\n")
+
+# ------------------------------------------------------------------
+# Batch plan: one API batch per sector_desc × group_desc
+# (deterministic order so cached chunk files line up across runs)
+# ------------------------------------------------------------------
+batch_plan <- lookup_raw %>%
+  distinct(sector_desc, group_desc, short_desc) %>%
+  group_by(sector_desc, group_desc) %>%
+  summarise(n_items = n(), items = list(sort(unique(short_desc))), .groups = "drop") %>%
+  arrange(desc(n_items), sector_desc, group_desc) %>%
+  mutate(batch_id = row_number())
+
+# ------------------------------------------------------------------
+# short_desc → Ch 2 table tag (same rule as the original pulls)
+# ------------------------------------------------------------------
+sd_to_tables <- lookup_raw %>%
+  distinct(short_desc, table, table_name) %>%
+  group_by(short_desc) %>%
+  summarise(
+    ch2_tables     = paste(sort(unique(table)), collapse = ";"),
+    ch2_table_name = first(table_name),
+    .groups        = "drop"
+  )
+
+# ------------------------------------------------------------------
+# API cache folder — keyed to state + lookup contents, so editing the
+# lookup automatically starts a fresh cache
+# ------------------------------------------------------------------
+lookup_sig <- substr(unname(tools::md5sum(LOOKUP_PATH)), 1, 8)
+CACHE_DIR  <- file.path(OUT_DIR, "_nass_api_cache", glue("{STATE_ALPHA}_{lookup_sig}"))
+if (REFRESH_CACHE && dir.exists(CACHE_DIR)) unlink(CACHE_DIR, recursive = TRUE)
+dir.create(CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+cat("  API cache:", CACHE_DIR, "\n")
+```
+
+```{r table1_spec}
+# ============================================================================
+# TABLE 1 CELL SPECIFICATION — one row per published Table 1 cell
+# ============================================================================
+t1_spec <- lookup_raw %>%
+  filter(table == TABLE1_NUM) %>%
+  distinct(table_name, short_desc, domain_desc, domaincat_desc, unit_desc)
+
+# Published row order ("Census Row") from the User Guide workbook, when available
+t1_rows <- tibble(short_desc = character(), domain_desc = character(),
+                  domaincat_desc = character(), table_row = integer())
+
+if (!is.na(GUIDE_PATH)) {
+  t1_rows <- tryCatch({
+    g <- readxl::read_excel(GUIDE_PATH, sheet = "Metadata - Ch 2 Tables 1 to 57")
+    names(g) <- janitor::make_clean_names(sub("\n.*$", "", names(g)))
+    g %>%
+      filter(census_table == TABLE1_NUM) %>%
+      transmute(short_desc, domain_desc, domaincat_desc,
+                table_row = as.integer(census_row)) %>%
+      distinct()
+  }, error = function(e) {
+    cat("Could not read row order from the User Guide:", conditionMessage(e), "\n")
+    t1_rows
+  })
+}
+
+t1_spec <- t1_spec %>%
+  left_join(t1_rows, by = c("short_desc", "domain_desc", "domaincat_desc"))
+
+# Any cell without a published row number goes to the end, in lookup order
+if (anyNA(t1_spec$table_row)) {
+  start <- max(c(0L, t1_spec$table_row), na.rm = TRUE)
+  t1_spec$table_row[is.na(t1_spec$table_row)] <- start + seq_len(sum(is.na(t1_spec$table_row)))
+}
+
+t1_spec <- t1_spec %>%
+  mutate(data_item = if_else(domain_desc == "TOTAL",
+                             short_desc,
+                             paste0(short_desc, " | ", domaincat_desc))) %>%
+  arrange(table_row)
+
+stopifnot("Table 1 cells are not unique in the lookup" =
+            !anyDuplicated(t1_spec[c("short_desc", "domain_desc", "domaincat_desc")]))
+
+cat("Table 1:", unique(t1_spec$table_name), "\n")
+cat("  Cells:", nrow(t1_spec), "| Unique short_desc:", n_distinct(t1_spec$short_desc), "\n")
+cat("  Row order:", if (nrow(t1_rows)) "published (User Guide)" else "lookup order (User Guide not found)", "\n")
+```
+
+# API Pull (Cached)
+
+```{r api_engine}
+# ============================================================================
+nassqs_auth(key = NASS_API_KEY)
+
+# Defaults, in case the setup chunk predates these settings
+if (!exists("API_TIMEOUT"))      API_TIMEOUT      <- 120  # seconds before one call is abandoned and split
+if (!exists("MAX_CONSEC_FAILS")) MAX_CONSEC_FAILS <- 3    # failed calls in a row before the pull stops
+
+MIN_SPLIT    <- 5   # smallest chunk a timed-out request is split down to
+consec_fails <- 0   # circuit-breaker counter, reset by any successful call
+
+api_log <- list()
+log_call <- function(geo, label, status, rows = NA_integer_, secs = NA_real_, error = NA_character_) {
+  api_log[[length(api_log) + 1]] <<- tibble(geo = geo, call = as.character(label), status = status,
+                                            rows = rows, secs = secs, error = error)
+}
+
+is_too_big <- function(msg) grepl("exceed|too large|50,?000|\\b413\\b|\\b414\\b|uri too long",
+                                  msg, ignore.case = TRUE)
+is_timeout <- function(msg) grepl("\\b504\\b|gateway time|timeout was reached|timed out",
+                                  msg, ignore.case = TRUE)
+is_no_data <- function(msg) grepl("invalid query|bad request|no data|no records",
+                                  msg, ignore.case = TRUE)
+
+nass_call <- function(params) {
+  res <- tryCatch({
+    # as_numeric = FALSE keeps NASS codes — (D), (Z) — instead of turning them into NA
+    dat <- if (requireNamespace("httr", quietly = TRUE)) {
+      httr::with_config(httr::timeout(API_TIMEOUT), nassqs(params, as_numeric = FALSE))
+    } else {
+      nassqs(params, as_numeric = FALSE)
+    }
+    dat %>%
+      as_tibble() %>%
+      clean_names() %>%
+      mutate(across(everything(), as.character))   # uniform types across chunks
+  }, error = function(e) e)
+
+  # Circuit breaker: count server-side failures; any real answer resets the count
+  if (inherits(res, "error") &&
+      !is_no_data(conditionMessage(res)) && !is_too_big(conditionMessage(res))) {
+    consec_fails <<- consec_fails + 1
+    if (consec_fails >= MAX_CONSEC_FAILS) {
+      stop(glue("NASS Quick Stats failed {consec_fails} calls in a row, so the pull stopped. ",
+                "Finished chunks are cached; re-knit later to resume.\n",
+                "Last error: {conditionMessage(res)}"), call. = FALSE)
+    }
+  } else {
+    consec_fails <<- 0
+  }
+  res
+}
+
+fetch_items <- function(items, base_params) {
+  params <- c(base_params, list(short_desc = items))
+  res    <- nass_call(params)
+  msg    <- if (inherits(res, "error")) conditionMessage(res) else ""
+
+  # One retry for other transient failures (502/503, dropped connection)
+  if (inherits(res, "error") && !is_too_big(msg) && !is_timeout(msg) && !is_no_data(msg)) {
+    Sys.sleep(5)
+    res <- nass_call(params)
+    msg <- if (inherits(res, "error")) conditionMessage(res) else ""
+  }
+
+  if (!inherits(res, "error")) return(list(data = res, status = "ok", error = NA_character_))
+
+  # Oversized or timed out: split in half and pull each half
+  floor_n <- if (is_timeout(msg)) MIN_SPLIT else 1
+  if ((is_too_big(msg) || is_timeout(msg)) && length(items) > floor_n) {
+    half  <- ceiling(length(items) / 2)
+    left  <- fetch_items(items[seq_len(half)], base_params)
+    Sys.sleep(API_DELAY)
+    right <- fetch_items(items[-seq_len(half)], base_params)
+    errs  <- na.omit(c(left$error, right$error))
+    return(list(
+      data   = bind_rows(left$data, right$data),
+      status = if (any(c(left$status, right$status) == "failed")) "failed" else "ok (split)",
+      error  = if (length(errs)) paste(errs, collapse = " | ") else NA_character_
+    ))
+  }
+
+  if (is_no_data(msg)) return(list(data = tibble(), status = "no data", error = NA_character_))
+
+  list(data = tibble(), status = "failed", error = msg)
+}
+
+pull_geo <- function(agg_level, chunk_size) {
+  out <- list()
+
+  for (b in seq_len(nrow(batch_plan))) {
+    bp     <- batch_plan[b, ]
+    items  <- bp$items[[1]]
+    chunks <- split(items, ceiling(seq_along(items) / chunk_size))
+
+    base_params <- list(
+      source_desc    = "CENSUS",
+      agg_level_desc = agg_level,
+      sector_desc    = bp$sector_desc,
+      group_desc     = bp$group_desc
+    )
+    if (agg_level != "NATIONAL") base_params$state_alpha <- STATE_ALPHA
+
+    for (i in seq_along(chunks)) {
+      label      <- glue("{bp$sector_desc} | {bp$group_desc} | chunk {i}/{length(chunks)}")
+      cache_file <- file.path(CACHE_DIR, sprintf("%s_cs%02d_b%02d_c%02d.rds",
+                                                 agg_level, chunk_size, bp$batch_id, i))
+
+      if (USE_CACHE && file.exists(cache_file)) {
+        dat <- readRDS(cache_file)
+        log_call(agg_level, label, "cached", nrow(dat))
+        out[[length(out) + 1]] <- dat
+        next
+      }
+
+      t0   <- Sys.time()
+      res  <- fetch_items(chunks[[i]], base_params)
+      secs <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+      log_call(agg_level, label, res$status, nrow(res$data), secs, res$error)
+
+      # Progress to the console only (keeps the HTML report clean)
+      cat(sprintf("  [%-8s] %-55s %-10s %6d rows (%.1fs)\n",
+                  agg_level, label, res$status, nrow(res$data), secs), file = stderr())
+      if (res$status == "failed") {
+        cat("             error:", substr(gsub("\\s+", " ", res$error), 1, 160), "\n", file = stderr())
+      }
+
+      if (res$status != "failed") {
+        if (USE_CACHE) saveRDS(res$data, cache_file)
+        out[[length(out) + 1]] <- res$data
+      }
+      Sys.sleep(API_DELAY)
+    }
+  }
+
+  bind_rows(out)
+}
+```
+
+```{r execute_pulls, cache=FALSE}
+api_log_df   <- tibble(geo = character(), call = character(), status = character(),
+                       rows = integer(), secs = numeric(), error = character())
+pull_minutes <- 0
+
+if (DATA_SOURCE == "saved") {
+  # ------------------------------------------------------------------
+  # Rebuild from the unfiltered masters the original pulls saved.
+  # Read everything as text so (D)/(Z) codes and leading-zero codes survive;
+  # value_num, censored and the Ch 2 tags are re-derived in the next chunk.
+  # ------------------------------------------------------------------
+  read_master <- function(fname) {
+    path <- file.path(OUT_DIR, fname)
+    if (!file.exists(path)) {
+      stop(glue("Saved master not found: {path}\n",
+                "Point MASTER_*_FILE at it, or set DATA_SOURCE <- \"api\"."), call. = FALSE)
+    }
+    cat("Reading", path, "\n")
+    read_csv(path, col_types = cols(.default = col_character()))
+  }
+
+  master_state_raw <- read_master(MASTER_STATE_FILE)
+  if (!"state_fips_code" %in% names(master_state_raw)) {
+    master_state_raw$state_fips_code <- if_else(master_state_raw$agg_level_desc == "NATIONAL",
+                                                 "99", STATE_FIPS)
+  }
+
+  raw_state  <- master_state_raw %>% filter(agg_level_desc == "STATE")
+  raw_nat    <- if (PULL_NATIONAL) filter(master_state_raw, agg_level_desc == "NATIONAL") else tibble()
+  raw_county <- read_master(MASTER_COUNTY_FILE)
+
+  cat("Source: saved master CSVs (no API calls)\n")
+
+} else {
+  t_start <- Sys.time()
+
+  raw_state  <- pull_geo("STATE",  CHUNK_SIZE_STATE)
+  raw_nat    <- if (PULL_NATIONAL) pull_geo("NATIONAL", CHUNK_SIZE_STATE) else tibble()
+  raw_county <- pull_geo("COUNTY", CHUNK_SIZE_COUNTY)
+
+  pull_minutes <- round(as.numeric(difftime(Sys.time(), t_start, units = "mins")), 1)
+  api_log_df   <- bind_rows(api_log)
+  cat("Source: Quick Stats API, pull finished in", pull_minutes, "minutes\n")
+}
+
+cat("  Raw rows — STATE:", nrow(raw_state), "| NATIONAL:", nrow(raw_nat),
+    "| COUNTY:", nrow(raw_county), "\n")
+
+if (nrow(api_log_df) > 0) {
+  api_log_df %>%
+    count(geo, status) %>%
+    pivot_wider(names_from = status, values_from = n, values_fill = 0) %>%
+    kable(caption = "API calls by geography and outcome ('cached' = reused from a previous knit)")
+}
+```
+
+# Assemble Master Data
+
+```{r standardize}
+
+# ============================================================================
+# STANDARDIZE RAW PULLS
+#   value      — published value, whitespace trimmed (e.g. "1,234" or "(D)")
+#   value_num  — numeric value; NA when NASS publishes a code instead of a number
+#   censored   — TRUE when the published value is a NASS code — (D) withheld,
+#                (Z) less than half the unit, (NA), (X), etc. — rather than a number
+#
+# Every Quick Stats row carries either a number or a code, so a row with no
+# number is a code. rnassqs::nassqs() defaults to as_numeric = TRUE, which turns
+# (D)/(Z) into NA; the original masters were pulled that way. Pull with
+# as_numeric = FALSE (api_engine) to keep NASS's exact code. On older pulls the
+# code is taken from CV (%) where NASS repeats it; otherwise value stays blank
+# (censored, code unknown) and a warning says how many rows need a re-pull.
+# ============================================================================
+keep_cols <- c(
+  "source_desc", "sector_desc", "group_desc", "commodity_desc",
+  "class_desc", "prodn_practice_desc",
+  "statisticcat_desc", "domain_desc", "domaincat_desc",
+  "short_desc", "unit_desc",
+  "agg_level_desc", "state_alpha", "state_name", "state_fips_code",
+  "county_code", "county_ansi", "county_name", "asd_code", "asd_desc",
+  "year", "freq_desc", "reference_period_desc",
+  "value", "cv_percent"
+)
+
+standardize <- function(raw) {
+  if (nrow(raw) == 0) return(tibble())
+  if (!"cv_percent" %in% names(raw)) raw$cv_percent <- NA_character_
+  out <- raw %>%
+    select(any_of(keep_cols)) %>%
+    distinct() %>%
+    mutate(
+      value      = str_squish(value),
+      year       = as.integer(year),
+      value_num  = suppressWarnings(parse_number(value)),
+      censored   = is.na(value_num),
+      value      = if_else(censored,
+                           coalesce(str_extract(value, "\\([A-Z]+\\)"),
+                                    str_extract(str_squish(cv_percent), "\\((D|Z)\\)")),
+                           value)
+    ) %>%
+    left_join(sd_to_tables, by = "short_desc") %>%
+    mutate(
+      ch2_tables     = coalesce(ch2_tables, "EXTRA"),
+      ch2_table_name = coalesce(ch2_table_name, "(not in Ch2 lookup)")
+    )
+  n_lost <- sum(out$censored & is.na(out$value))
+  if (n_lost > 0) {   # cat, not warning(): the setup chunk hides warnings
+    cat("WARNING:", n_lost, "rows have no number and no NASS code (lost upstream).",
+        "Re-pull with DATA_SOURCE <- \"api\" to recover the exact codes.\n")
+  }
+  out
+}
+
+keep_years <- function(df) {
+  if (CENSUS_YEARS_ONLY) filter(df, year %in% CENSUS_YEARS) else df
+}
+
+drop_other <- function(df) {
+  if (DROP_OTHER_COUNTIES) filter(df, !grepl("^OTHER", county_name, ignore.case = TRUE)) else df
+}
+
+# "ANCHORAGE" → "Anchorage Area" (NASS's published Ag Census Area names)
+area_label <- function(x) {
+  x <- str_to_title(x)
+  if_else(grepl("Area$", x), x, paste(x, "Area"))
+}
+
+master_state  <- bind_rows(standardize(raw_state), standardize(raw_nat))
+master_county <- standardize(raw_county)
+
+cat("Master STATE/US:", nrow(master_state), "rows |",
+    n_distinct(master_state$short_desc), "items | years:",
+    paste(sort(unique(master_state$year)), collapse = ", "), "|",
+    sum(master_state$censored), "published as a code\n")
+cat("Master COUNTY:  ", nrow(master_county), "rows |",
+    n_distinct(master_county$short_desc), "items | areas:",
+    paste(sort(unique(master_county$county_name)), collapse = ", "), "|",
+    sum(master_county$censored), "published as a code\n")
+
+```
+
+# Write Partner Exports
+
+```{r export_helper}
+# export_manifest <- list()
+
+# write_export <- function(df, fname, contents) {
+#   path <- file.path(EXPORT_DIR, fname)
+#   write_csv(df, path)
+#   export_manifest[[length(export_manifest) + 1]] <<- tibble(
+#     file       = as.character(fname),
+#     contents   = contents,
+#     rows       = nrow(df),
+#     data_items = if (nrow(df)) n_distinct(df$short_desc) else 0L,
+#     years      = if (nrow(df)) paste(sort(unique(df$year)), collapse = ", ") else "",
+#     size_kb    = round(file.size(path) / 1024)
+#   )
+#   invisible(path)
+# }
+
+# # Match raw rows to the exact published Table 1 cells
+# t1_match <- function(df) {
+#   df %>%
+#     inner_join(t1_spec %>% select(short_desc, domain_desc, domaincat_desc, table_row, data_item),
+#                by = c("short_desc", "domain_desc", "domaincat_desc"))
+# }
+export_manifest <- list()
+
+write_export <- function(df, fname, contents) {
+  path <- file.path(EXPORT_DIR, fname)
+  write_csv(df, path)
+  export_manifest[[length(export_manifest) + 1]] <<- tibble(
+    file       = as.character(fname),
+    contents   = contents,
+    rows       = nrow(df),
+    data_items = if (nrow(df)) n_distinct(df$short_desc) else 0L,
+    years      = if (nrow(df)) paste(sort(unique(df$year)), collapse = ", ") else "",
+    size_kb    = round(file.size(path) / 1024)
+  )
+  invisible(path)
+}
+
+# Table 1 files use the compact files' field format: value and value_num are plain
+# numbers (NA where there is no number); the NASS code for those cells goes in nass_code
+partner_format <- function(df) {
+  df %>%
+    mutate(nass_code = if_else(censored, value, NA_character_), .after = censored) %>%
+    mutate(value = value_num)
+}
+
+# Match raw rows to the exact published Table 1 cells
+t1_match <- function(df) {
+  df %>%
+    inner_join(t1_spec %>% select(short_desc, domain_desc, domaincat_desc, table_row, data_item),
+               by = c("short_desc", "domain_desc", "domaincat_desc"))
+}
+```
+
+## Table 1 Added Rows (Food Fish)
+
+```{r table1_context_rows}
+# ============================================================================
+# TABLE 1 ADDED ROWS — appended after the published cells in exports (1) and (2)
+# ----------------------------------------------------------------------------
+# Market value of ag products sold includes food fish (excl. catfish & trout),
+# which in Alaska is mostly salmon hatchery production. These rows bring food
+# fish in from Ch 2 Table 22 and net it out of the Table 1 sales totals.
+#
+# Published values only — nothing is estimated:
+#   - food fish rows carry the published number or NASS code as-is
+#   - a derived row is computed only when every input is a published number;
+#     otherwise it is (D) if any input is withheld, else (NA) (e.g. an input
+#     that is (Z), or food fish that NASS did not publish for that year)
+#   - years when NASS did not publish a food fish item for the state are (NA):
+#     sales dollars start in 2007 (1997 had no food fish item; 2002 published
+#     farm counts only), operations start in 2002
+#   - in a year the item is published, a geography with no row and no food
+#     fish operations is 0 (the published table lists no farms there);
+#     FOOD_FISH_MISSING_AS_ZERO <- FALSE makes those (NA) too
+# ============================================================================
+SD_TOTAL_SALES  <- "COMMODITY TOTALS - SALES, MEASURED IN $"
+SD_ANIMAL_SALES <- "ANIMAL TOTALS, INCL PRODUCTS - SALES, MEASURED IN $"
+SD_FARMS        <- "FARM OPERATIONS - NUMBER OF OPERATIONS"
+SD_FISH_SALES   <- "FOOD FISH, (EXCL CATFISH & TROUT) - SALES & DISTRIBUTION, MEASURED IN $"
+SD_FISH_OPS     <- "FOOD FISH, (EXCL CATFISH & TROUT) - OPERATIONS WITH SALES & DISTRIBUTION"
+
+# Census years in which NASS published each food fish item for the state
+item_years <- function(sd) {
+  master_state %>%
+    filter(agg_level_desc == "STATE", domain_desc == "TOTAL", short_desc == sd) %>%
+    pull(year) %>%
+    unique()
+}
+FISH_SALES_YEARS <- item_years(SD_FISH_SALES)
+FISH_OPS_YEARS   <- item_years(SD_FISH_OPS)
+cat("Food fish sales published for:", paste(sort(FISH_SALES_YEARS), collapse = ", "),
+    "| operations:", paste(sort(FISH_OPS_YEARS), collapse = ", "), "\n")
+
+# Short snake_case names for every published Table 1 cell
+# ("COMMODITY TOTALS - SALES, MEASURED IN $ / OPERATION" → commodity_totals_sales_usd_per_operation)
+make_var_name <- function(x) {
+  x %>%
+    str_replace_all("\\$", " usd ") %>%
+    str_replace_all("/", " per ") %>%
+    str_replace_all("&", " and ") %>%
+    str_replace_all("MEASURED IN|\\|", " ") %>%
+    janitor::make_clean_names()
+}
+t1_names <- t1_spec %>% transmute(table_row, var_name = make_var_name(data_item))
+
+# The six added rows, numbered after the last published Table 1 row
+derived_spec <- tribble(
+  ~var_name, ~data_item, ~short_desc, ~unit_desc, ~row_type, ~note,
+  "food_fish_sales_usd",
+    "FOOD FISH (HATCHERY), EXCL CATFISH & TROUT - SALES & DISTRIBUTION, MEASURED IN $",
+    SD_FISH_SALES, "$", "Added context: Ch 2 Table 22",
+    "Food fish (excl. catfish & trout) sales and distribution; in Alaska mostly salmon hatcheries",
+  "food_fish_operations",
+    "FOOD FISH (HATCHERY), EXCL CATFISH & TROUT - OPERATIONS WITH SALES & DISTRIBUTION",
+    SD_FISH_OPS, "OPERATIONS", "Added context: Ch 2 Table 22",
+    "Operations reporting food fish (excl. catfish & trout) sales and distribution",
+  "ag_sales_excl_food_fish_usd",
+    "AG SALES EXCL FOOD FISH - SALES, MEASURED IN $",
+    NA, "$", "Derived",
+    "commodity_totals_sales_usd minus food_fish_sales_usd",
+  "animal_sales_excl_food_fish_usd",
+    "ANIMAL SALES EXCL FOOD FISH - SALES, MEASURED IN $",
+    NA, "$", "Derived",
+    "animal_totals_incl_products_sales_usd minus food_fish_sales_usd (keeps livestock, poultry, products and other aquaculture)",
+  "food_fish_pct_of_ag_sales",
+    "FOOD FISH - SHARE OF TOTAL AG SALES, MEASURED IN PCT",
+    NA, "PCT", "Derived",
+    "food_fish_sales_usd / commodity_totals_sales_usd x 100",
+  "ag_sales_excl_food_fish_per_farm_usd",
+    "AG SALES EXCL FOOD FISH - SALES, MEASURED IN $ / OPERATION",
+    NA, "$ / OPERATION", "Derived",
+    "ag_sales_excl_food_fish_usd / (farm_operations_number_of_operations minus food_fish_operations)"
+) %>%
+  mutate(table_row = max(t1_spec$table_row) + row_number())
+
+# Note appended to a row when its food fish input was not a published row
+status_note <- c(
+  none          = "no food fish reported here in a year NASS published food fish, counted as 0",
+  missing       = "food fish operations reported but no food fish sales row published",
+  not_published = "NASS did not publish this food fish item for this Census year"
+)
+
+# Published Table 1 rows, standard export columns
+t1_publish_rows <- function(base) {
+  base %>%
+    t1_match() %>%
+    left_join(t1_names, by = "table_row") %>%
+    transmute(geo_level, state_alpha, geo_code, geo_name,
+              year, table_row, data_item,
+              short_desc, domain_desc, domaincat_desc, unit_desc,
+              value, value_num, censored,
+              row_type = "NASS Table 1", var_name, note = NA_character_)
+}
+
+# Added food fish rows for every geography-year that has a total-sales row
+t1_context_rows <- function(base) {
+  if (!ADD_CONTEXT_ROWS) return(tibble())
+  keys  <- c("geo_level", "state_alpha", "geo_code", "geo_name", "year")
+  parts <- c(total = SD_TOTAL_SALES, animal = SD_ANIMAL_SALES, farms = SD_FARMS,
+             fish = SD_FISH_SALES, fish_ops = SD_FISH_OPS)
+
+  comp <- base %>%
+    filter(domain_desc == "TOTAL", short_desc %in% parts) %>%
+    mutate(part = names(parts)[match(short_desc, parts)]) %>%
+    distinct(geo_level, state_alpha, geo_code, geo_name, year, part, .keep_all = TRUE) %>%
+    select(all_of(keys), part, value, value_num, censored) %>%
+    pivot_wider(names_from = part, values_from = c(value, value_num, censored), names_sep = ".")
+
+  for (p in names(parts)) {     # make sure every input column exists (NA = no row)
+    for (col in c("value", "value_num", "censored")) {
+      nm <- paste0(col, ".", p)
+      if (!nm %in% names(comp)) comp[[nm]] <- if (col == "value_num") NA_real_ else NA
+    }
+  }
+
+  comp <- comp %>%
+    filter(!is.na(value_num.total) | censored.total %in% TRUE)
+  if (nrow(comp) == 0) return(tibble())
+
+  # Status of the two food fish inputs: published row / none (0) / missing / not published
+  comp <- comp %>%
+    mutate(
+      has_fish_ops = censored.fish_ops %in% TRUE | coalesce(value_num.fish_ops > 0, FALSE),
+      fish_status = case_when(
+        !is.na(censored.fish)                                 ~ "published",
+        !year %in% FISH_SALES_YEARS                           ~ "not_published",
+        !has_fish_ops & FOOD_FISH_MISSING_AS_ZERO             ~ "none",
+        TRUE                                                  ~ "missing"
+      ),
+      ops_status = case_when(
+        !is.na(censored.fish_ops)                             ~ "published",
+        !year %in% FISH_OPS_YEARS                             ~ "not_published",
+        FOOD_FISH_MISSING_AS_ZERO                             ~ "none",
+        TRUE                                                  ~ "missing"
+      )
+    )
+  for (p in c("fish", "fish_ops")) {
+    st   <- comp[[if (p == "fish") "fish_status" else "ops_status"]]
+    none <- st == "none"
+    gone <- st %in% c("missing", "not_published")
+    comp[[paste0("value_num.", p)]][none] <- 0
+    comp[[paste0("censored.", p)]][none]  <- FALSE
+    comp[[paste0("value.", p)]][gone]     <- "(NA)"
+    comp[[paste0("censored.", p)]][gone]  <- TRUE
+  }
+
+  v <- function(p) comp[[paste0("value_num.", p)]]
+  # NASS code for a value: its own code for a published input; for a derived value,
+  # (D) if any input is withheld, else (NA) if any input is not a number
+  code <- function(...) {
+    ps   <- c(...)
+    cens <- Reduce(`|`, lapply(ps, function(p) comp[[paste0("censored.", p)]] %in% TRUE))
+    if (length(ps) == 1) return(if_else(cens, coalesce(comp[[paste0("value.", ps)]], "(NA)"), NA_character_))
+    anyD <- Reduce(`|`, lapply(ps, function(p) comp[[paste0("censored.", p)]] %in% TRUE &
+                                           comp[[paste0("value.", p)]] %in% "(D)"))
+    case_when(anyD ~ "(D)", cens ~ "(NA)", TRUE ~ NA_character_)
+  }
+  calc <- function(var, num, cd) {
+    bind_cols(comp[keys], tibble(fish_status = comp$fish_status, ops_status = comp$ops_status,
+                                 var_name = var, value_num = num, code = cd))
+  }
+
+  bind_rows(
+    calc("food_fish_sales_usd",                  v("fish"),                    code("fish")),
+    calc("food_fish_operations",                 v("fish_ops"),                code("fish_ops")),
+    calc("ag_sales_excl_food_fish_usd",          v("total") - v("fish"),       code("total", "fish")),
+    calc("animal_sales_excl_food_fish_usd",      v("animal") - v("fish"),      code("animal", "fish")),
+    calc("food_fish_pct_of_ag_sales",            100 * v("fish") / v("total"), code("total", "fish")),
+    calc("ag_sales_excl_food_fish_per_farm_usd", (v("total") - v("fish")) /
+                                                   (v("farms") - v("fish_ops")), code("total", "fish", "farms", "fish_ops"))
+  ) %>%
+    mutate(
+      code      = if_else(is.na(code) & !is.finite(value_num), "(NA)", code),   # e.g. divide by 0
+      censored  = !is.na(code),
+      value_num = if_else(censored, NA_real_, value_num)
+    ) %>%
+    left_join(derived_spec, by = "var_name") %>%
+    mutate(
+      value = case_when(
+        censored           ~ code,
+        unit_desc == "PCT" ~ sprintf("%.1f", value_num),
+        TRUE               ~ format(round(value_num), big.mark = ",", scientific = FALSE, trim = TRUE)
+      ),
+      status = if_else(var_name == "food_fish_operations", ops_status, fish_status),
+      note   = if_else(status == "published", note, paste0(note, "; ", status_note[status])),
+      domain_desc    = "TOTAL",
+      domaincat_desc = "NOT SPECIFIED"
+    ) %>%
+    transmute(geo_level, state_alpha, geo_code, geo_name,
+              year, table_row, data_item,
+              short_desc, domain_desc, domaincat_desc, unit_desc,
+              value, value_num, censored,
+              row_type, var_name, note) %>%
+    arrange(geo_name, table_row, year)
+}
+```
+
+## (1) Table 1 — State
+
+```{r export_1_table1_state}
+state_base <- master_state %>%
+  filter(agg_level_desc == "STATE", state_alpha == STATE_ALPHA) %>%
+  keep_years() %>%
+  mutate(geo_level = "STATE", geo_code = state_fips_code, geo_name = str_to_title(state_name))
+
+# Published Table 1 cells, then the added food fish rows at the end of the file
+t1_state <- bind_rows(
+  t1_publish_rows(state_base) %>% arrange(table_row, year),
+  t1_context_rows(state_base)
+)
+
+#write_export(t1_state, FILE_T1_STATE,
+write_export(partner_format(t1_state), FILE_T1_STATE,
+             "Table 1 State Summary Highlights: state, all Census years")
+
+cat("Saved:", FILE_T1_STATE, "—", nrow(t1_state), "rows,",
+    n_distinct(t1_state$table_row[t1_state$row_type == "NASS Table 1"]), "of", nrow(t1_spec),
+    "Table 1 cells present +", sum(t1_state$row_type != "NASS Table 1"), "added rows\n")
+```
+
+## (2) Table 1 — Ag Census Areas
+
+```{r export_2_table1_areas}
+area_base <- master_county %>%
+  filter(agg_level_desc == "COUNTY") %>%
+  drop_other() %>%
+  keep_years() %>%
+  mutate(geo_level = "AG CENSUS AREA", geo_code = county_code, geo_name = area_label(county_name))
+
+# Published Table 1 cells, then the added food fish rows at the end of the file
+t1_area <- bind_rows(
+  t1_publish_rows(area_base) %>% arrange(geo_name, table_row, year),
+  t1_context_rows(area_base)
+)
+
+#write_export(t1_area, FILE_T1_AREA,
+write_export(partner_format(t1_area), FILE_T1_AREA,
+             "Table 1 State Summary Highlights: Ag Census Areas, all Census years")
+
+cat("Saved:", FILE_T1_AREA, "—", nrow(t1_area), "rows |",
+    n_distinct(t1_area$geo_name), "areas:", paste(sort(unique(t1_area$geo_name)), collapse = ", "),
+    "|", sum(t1_area$row_type != "NASS Table 1"), "added rows\n")
+```
+
+## (3) Compact — State (+ US)
+
+```{r export_3_compact_state}
+# # Same columns, filters and sort as the original state compact file
+# compact_state <- master_state %>%
+#   select(agg_level_desc, state_alpha,
+#          year, source_desc, short_desc, unit_desc,
+#          sector_desc, group_desc, commodity_desc,
+#          domain_desc, domaincat_desc,
+#          value, value_num, censored, ch2_tables, ch2_table_name) %>%
+#   keep_years()
+
+# if (!is.null(COMPACT_DOMAINS_KEEP)) {
+#   compact_state <- compact_state %>% filter(domain_desc %in% COMPACT_DOMAINS_KEEP)
+# }
+
+# compact_state <- compact_state %>% arrange(ch2_tables, short_desc, year)
+
+# write_export(compact_state, FILE_COMPACT_STATE,
+#              "Ch 2 Tables 1-57 compact: state (+ US), Census years, TOTAL + NAICS domains")
+
+# cat("Saved:", FILE_COMPACT_STATE, "—", nrow(compact_state), "rows |",
+#     "geographies:", paste(sort(unique(compact_state$agg_level_desc)), collapse = ", "), "\n")
+# Same columns, types, filters and sort as the original state compact file, which
+# partners ingest. Field formats are kept exactly as the original pull wrote them:
+#   value, value_num — plain numbers, no separators; NA where NASS shows a code
+#   censored         — the original rule: a (D), (H) or (Z) flag in NASS's CV column
+# (The NASS codes themselves are carried in the Table 1 files, column nass_code.)
+compact_state <- master_state %>%
+  mutate(value    = value_num,
+         censored = grepl("\\(D\\)|\\(H\\)|\\(Z\\)", cv_percent)) %>%
+  select(agg_level_desc, state_alpha,
+         year, source_desc, short_desc, unit_desc,
+         sector_desc, group_desc, commodity_desc,
+         domain_desc, domaincat_desc,
+         value, value_num, censored, ch2_tables, ch2_table_name) %>%
+  keep_years()
+
+if (!is.null(COMPACT_DOMAINS_KEEP)) {
+  compact_state <- compact_state %>% filter(domain_desc %in% COMPACT_DOMAINS_KEEP)
+}
+
+compact_state <- compact_state %>% arrange(ch2_tables, short_desc, year)
+
+write_export(compact_state, FILE_COMPACT_STATE,
+             "Ch 2 Tables 1-57 compact: state (+ US), Census years, TOTAL + NAICS domains")
+
+cat("Saved:", FILE_COMPACT_STATE, "—", nrow(compact_state), "rows |",
+    "geographies:", paste(sort(unique(compact_state$agg_level_desc)), collapse = ", "), "\n")
+```
+
+## (4) Compact — Ag Census Areas
+
+```{r export_4_compact_county}
+# # Same columns, filters and sort as the original county compact file
+# compact_county <- master_county %>%
+#   select(county_name, county_code,
+#          year, source_desc, short_desc, unit_desc,
+#          sector_desc, group_desc, commodity_desc,
+#          domain_desc, domaincat_desc,
+#          value, value_num, censored, ch2_tables, ch2_table_name) %>%
+#   keep_years()
+
+# if (!is.null(COMPACT_DOMAINS_KEEP)) {
+#   compact_county <- compact_county %>% filter(domain_desc %in% COMPACT_DOMAINS_KEEP)
+# }
+
+# compact_county <- compact_county %>%
+#   drop_other() %>%
+#   arrange(county_name, ch2_tables, short_desc, year)
+
+# write_export(compact_county, FILE_COMPACT_COUNTY,
+#              "Ch 2 Tables 1-57 compact: Ag Census Areas, Census years, TOTAL + NAICS domains")
+
+# cat("Saved:", FILE_COMPACT_COUNTY, "—", nrow(compact_county), "rows |",
+#     n_distinct(compact_county$county_name), "areas\n")
+# Same columns, types, filters and sort as the original county compact file
+# (field formats as in export (3))
+compact_county <- master_county %>%
+  mutate(value    = value_num,
+         censored = grepl("\\(D\\)|\\(H\\)|\\(Z\\)", cv_percent)) %>%
+  select(county_name, county_code,
+         year, source_desc, short_desc, unit_desc,
+         sector_desc, group_desc, commodity_desc,
+         domain_desc, domaincat_desc,
+         value, value_num, censored, ch2_tables, ch2_table_name) %>%
+  keep_years()
+
+if (!is.null(COMPACT_DOMAINS_KEEP)) {
+  compact_county <- compact_county %>% filter(domain_desc %in% COMPACT_DOMAINS_KEEP)
+}
+
+compact_county <- compact_county %>%
+  drop_other() %>%
+  arrange(county_name, ch2_tables, short_desc, year)
+
+write_export(compact_county, FILE_COMPACT_COUNTY,
+             "Ch 2 Tables 1-57 compact: Ag Census Areas, Census years, TOTAL + NAICS domains")
+
+cat("Saved:", FILE_COMPACT_COUNTY, "—", nrow(compact_county), "rows |",
+    n_distinct(compact_county$county_name), "areas\n")
+```
+
+# Quality Control {.tabset}
+
+## Export Manifest
+
+```{r qc_manifest}
+bind_rows(export_manifest) %>%
+  kable(caption = glue("Partner exports written to {EXPORT_DIR}"),
+        col.names = c("File", "Contents", "Rows", "Data items", "Years", "KB"))
+```
+
+## Table 1 Coverage
+
+```{r qc_table1_coverage}
+t1_all <- bind_rows(t1_state, t1_area)
+t1_pub <- t1_all %>% filter(row_type == "NASS Table 1")
+
+if (nrow(t1_pub) > 0) {
+  t1_pub %>%
+    group_by(geo_name, year) %>%
+    summarise(cells = sum(!is.na(value_num)), .groups = "drop") %>%
+    pivot_wider(names_from = year, values_from = cells, values_fill = 0, names_sort = TRUE) %>%
+    kable(caption = glue("Table 1 cells with a published number, of {nrow(t1_spec)} (suppressed and absent cells excluded)"))
+}
+```
+
+```{r qc_table1_censored}
+if (nrow(t1_pub) > 0) {
+  t1_pub %>%
+    filter(censored) %>%
+    count(geo_name, value, name = "cells") %>%
+    pivot_wider(names_from = value, values_from = cells, values_fill = 0) %>%
+    kable(caption = "Table 1 cells published as a NASS code instead of a number")
+}
+```
+
+## Table 1 Added Rows
+
+```{r qc_table1_added}
+t1_added <- t1_all %>% filter(row_type != "NASS Table 1")
+
+if (nrow(t1_added) > 0) {
+  t1_added %>%
+    filter(geo_level == "STATE") %>%
+    select(table_row, var_name, year, value) %>%
+    pivot_wider(names_from = year, values_from = value, names_sort = TRUE) %>%
+    arrange(table_row) %>%
+    select(-table_row) %>%
+    kable(caption = glue("Added rows, {STATE_ALPHA} state level (value or (D))"))
+} else {
+  cat("No added rows (ADD_CONTEXT_ROWS is FALSE or no total-sales rows were found).\n")
+}
+```
+
+```{r qc_table1_zero_filled}
+filled <- t1_added %>%
+  filter(grepl("counted as 0", note)) %>%
+  distinct(geo_name, year) %>%
+  count(geo_name, name = "years_with_no_food_fish_row")
+
+if (nrow(filled) > 0) {
+  kable(filled, caption = "Geography-years with no food fish row, counted as $0 (FOOD_FISH_MISSING_AS_ZERO)")
+}
+```
+
+```{r qc_table1_missing}
+# Table 1 cells with no row for the state in any Census year — for Alaska this is
+# mostly commodities not grown here (cotton, rice, peanuts, ...)
+t1_spec %>%
+  anti_join(t1_state %>% distinct(short_desc, domain_desc, domaincat_desc),
+            by = c("short_desc", "domain_desc", "domaincat_desc")) %>%
+  select(table_row, data_item, unit_desc) %>%
+  kable(caption = glue("Table 1 cells with no {STATE_ALPHA} state-level row in any year"),
+        col.names = c("Row", "Data item", "Unit"))
+```
+
+## Duplicate Check
+
+```{r qc_duplicates}
+dup_t1 <- t1_all %>%
+  count(geo_level, geo_name, year, table_row) %>%
+  filter(n > 1)
+
+if (nrow(dup_t1) == 0) {
+  cat("OK — one row per geography × year × Table 1 cell in files (1) and (2).\n")
+} else {
+  cat("WARNING —", nrow(dup_t1), "geography × year × cell combinations have more than one row.\n")
+  kable(dup_t1, caption = "Duplicated Table 1 keys")
+}
+```
+
+## API Failures
+
+```{r qc_failures}
+failed <- api_log_df %>% filter(status == "failed")
+
+if (nrow(failed) == 0) {
+  cat("No failed API calls. Every chunk is cached for the next knit.\n")
+} else {
+  cat("WARNING:", nrow(failed), "API calls failed and were not cached —",
+      "re-knit to retry just these.\n")
+  failed %>%
+    mutate(error = substr(error, 1, 120)) %>%
+    select(geo, call, error) %>%
+    kable(caption = "Failed API calls")
+}
+```
+
+# Session Summary
+
+```{r session_summary}
+cat("========================================\n")
+cat("AFPC PARTNER EXPORTS — SESSION SUMMARY\n")
+cat("========================================\n")
+cat("State:", STATE_ALPHA, "\n")
+cat("Completed:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+# cat("API pull:", pull_minutes, "minutes |",
+#     sum(api_log_df$status == "cached"), "cached /",
+#     sum(api_log_df$status != "cached"), "live calls |",
+#     sum(api_log_df$status == "failed"), "failed\n")
+if (DATA_SOURCE == "saved") {
+  cat("Data source: saved master CSVs in", OUT_DIR, "(no API calls)\n")
+} else {
+  cat("Data source: Quick Stats API,", pull_minutes, "minutes |",
+      sum(api_log_df$status == "cached"), "cached /",
+      sum(api_log_df$status != "cached"), "live calls |",
+      sum(api_log_df$status == "failed"), "failed\n")
+}
+cat("Exports:", EXPORT_DIR, "\n")
+for (m in export_manifest) cat(sprintf("  %-55s %8s rows\n", m$file, format(m$rows, big.mark = ",")))
+cat("========================================\n")
+```
+
+---
+
+*Report generated `r format(Sys.time(), '%B %d, %Y at %I:%M %p')` — `r CONTACT_NOTE`*
